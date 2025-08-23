@@ -22,6 +22,7 @@ type Config struct {
 	VectorDatabase *VectorDatabaseConfig `yaml:"vector_database" json:"vector_database"`
 	DocReader      *DocReaderConfig      `yaml:"docreader" json:"docreader"`
 	StreamManager  *StreamManagerConfig  `yaml:"stream_manager" json:"stream_manager"`
+	Cache          *CacheManagerConfig   `yaml:"cache" json:"cache"`
 }
 
 type DocReaderConfig struct {
@@ -132,6 +133,35 @@ type RedisConfig struct {
 	DB       int           `yaml:"db" json:"db"`             // Redis数据库
 	Prefix   string        `yaml:"prefix" json:"prefix"`     // 键前缀
 	TTL      time.Duration `yaml:"ttl" json:"ttl"`           // 过期时间(小时)
+}
+
+// CacheManagerConfig 缓存管理器配置
+type CacheManagerConfig struct {
+	Enabled           bool          `yaml:"enabled" json:"enabled"`                         // 是否启用缓存
+	Address           string        `yaml:"address" json:"address"`                         // Redis地址
+	Password          string        `yaml:"password" json:"password"`                       // Redis密码
+	DB                int           `yaml:"db" json:"db"`                                 // Redis数据库
+	PoolSize          int           `yaml:"pool_size" json:"pool_size"`                     // 连接池大小
+	MinIdleConns      int           `yaml:"min_idle_conns" json:"min_idle_conns"`           // 最小空闲连接数
+	MaxConnAge        time.Duration `yaml:"max_conn_age" json:"max_conn_age"`               // 最大连接年龄
+	DefaultTTL        time.Duration `yaml:"default_ttl" json:"default_ttl"`                 // 默认TTL
+	KeyPrefix         string        `yaml:"key_prefix" json:"key_prefix"`                   // 键前缀
+	ReadTimeout       time.Duration `yaml:"read_timeout" json:"read_timeout"`               // 读超时
+	WriteTimeout      time.Duration `yaml:"write_timeout" json:"write_timeout"`             // 写超时
+	EnableCompression bool          `yaml:"enable_compression" json:"enable_compression"`   // 启用压缩
+	CompressionLevel  int           `yaml:"compression_level" json:"compression_level"`     // 压缩级别
+	Knowledge         struct {
+		SearchResultsTTL time.Duration `yaml:"search_results_ttl" json:"search_results_ttl"` // 搜索结果TTL
+		KnowledgeBaseTTL time.Duration `yaml:"knowledge_base_ttl" json:"knowledge_base_ttl"` // 知识库TTL
+		KnowledgeInfoTTL time.Duration `yaml:"knowledge_info_ttl" json:"knowledge_info_ttl"` // 知识信息TTL
+		ChunkInfoTTL     time.Duration `yaml:"chunk_info_ttl" json:"chunk_info_ttl"`         // 块信息TTL
+	} `yaml:"knowledge" json:"knowledge"`
+	Vector struct {
+		VectorResultsTTL     time.Duration `yaml:"vector_results_ttl" json:"vector_results_ttl"`         // 向量搜索结果TTL
+		EmbeddingsTTL        time.Duration `yaml:"embeddings_ttl" json:"embeddings_ttl"`                 // 嵌入向量TTL
+		SimilarityResultsTTL time.Duration `yaml:"similarity_results_ttl" json:"similarity_results_ttl"` // 相似度结果TTL
+		QueryEmbeddingsTTL   time.Duration `yaml:"query_embeddings_ttl" json:"query_embeddings_ttl"`     // 查询嵌入向量TTL
+	} `yaml:"vector" json:"vector"`
 }
 
 // LoadConfig 从配置文件加载配置

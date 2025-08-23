@@ -27,6 +27,7 @@ import (
 	chatpipline "github.com/Tencent/WeKnora/internal/application/service/chat_pipline"
 	"github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/cache"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -58,6 +59,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initDatabase))
 	must(container.Provide(initFileService))
 	must(container.Provide(initAntsPool))
+	must(container.Provide(initCacheFactory))
 
 	// Register goroutine pool cleanup handler
 	must(container.Invoke(registerPoolCleanup))
@@ -245,20 +247,30 @@ func initFileService(cfg *config.Config) (interfaces.FileService, error) {
 // Parameters:
 //   - db: Database connection
 //   - cfg: Application configuration
+//   - cacheFactory: Cache factory for caching retrieval results
 //
 // Returns:
 //   - Configured retrieval engine registry
 //   - Error if initialization fails
-func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config) (interfaces.RetrieveEngineRegistry, error) {
+func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config, cacheFactory *cache.CacheFactory) (interfaces.RetrieveEngineRegistry, error) {
 	registry := retriever.NewRetrieveEngineRegistry()
 	retrieveDriver := strings.Split(os.Getenv("RETRIEVE_DRIVER"), ",")
 	log := logger.GetLogger(context.Background())
 
 	if slices.Contains(retrieveDriver, "postgres") {
 		postgresRepo := postgresRepo.NewPostgresRetrieveEngineRepository(db)
-		if err := registry.Register(
-			retriever.NewKVHybridRetrieveEngine(postgresRepo, types.PostgresRetrieverEngineType),
-		); err != nil {
+		baseEngine := retriever.NewKVHybridRetrieveEngine(postgresRepo, types.PostgresRetrieverEngineType)
+		
+		// Wrap with caching if cache factory is available
+		var engine interfaces.RetrieveEngineService
+		if cacheFactory != nil {
+			engine = retriever.NewCachedRetrieveEngine(baseEngine, cacheFactory)
+			log.Infof("Postgres retrieve engine wrapped with caching")
+		} else {
+			engine = baseEngine
+		}
+		
+		if err := registry.Register(engine); err != nil {
 			log.Errorf("Register postgres retrieve engine failed: %v", err)
 		} else {
 			log.Infof("Register postgres retrieve engine success")
@@ -274,11 +286,18 @@ func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config) (interfaces.Ret
 			log.Errorf("Create elasticsearch_v8 client failed: %v", err)
 		} else {
 			elasticsearchRepo := elasticsearchRepoV8.NewElasticsearchEngineRepository(client, cfg)
-			if err := registry.Register(
-				retriever.NewKVHybridRetrieveEngine(
-					elasticsearchRepo, types.ElasticsearchRetrieverEngineType,
-				),
-			); err != nil {
+			baseEngine := retriever.NewKVHybridRetrieveEngine(elasticsearchRepo, types.ElasticsearchRetrieverEngineType)
+			
+			// Wrap with caching if cache factory is available
+			var engine interfaces.RetrieveEngineService
+			if cacheFactory != nil {
+				engine = retriever.NewCachedRetrieveEngine(baseEngine, cacheFactory)
+				log.Infof("Elasticsearch v8 retrieve engine wrapped with caching")
+			} else {
+				engine = baseEngine
+			}
+			
+			if err := registry.Register(engine); err != nil {
 				log.Errorf("Register elasticsearch_v8 retrieve engine failed: %v", err)
 			} else {
 				log.Infof("Register elasticsearch_v8 retrieve engine success")
@@ -296,11 +315,18 @@ func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config) (interfaces.Ret
 			log.Errorf("Create elasticsearch_v7 client failed: %v", err)
 		} else {
 			elasticsearchRepo := elasticsearchRepoV7.NewElasticsearchEngineRepository(client, cfg)
-			if err := registry.Register(
-				retriever.NewKVHybridRetrieveEngine(
-					elasticsearchRepo, types.ElasticsearchRetrieverEngineType,
-				),
-			); err != nil {
+			baseEngine := retriever.NewKVHybridRetrieveEngine(elasticsearchRepo, types.ElasticsearchRetrieverEngineType)
+			
+			// Wrap with caching if cache factory is available
+			var engine interfaces.RetrieveEngineService
+			if cacheFactory != nil {
+				engine = retriever.NewCachedRetrieveEngine(baseEngine, cacheFactory)
+				log.Infof("Elasticsearch v7 retrieve engine wrapped with caching")
+			} else {
+				engine = baseEngine
+			}
+			
+			if err := registry.Register(engine); err != nil {
 				log.Errorf("Register elasticsearch_v7 retrieve engine failed: %v", err)
 			} else {
 				log.Infof("Register elasticsearch_v7 retrieve engine success")
@@ -372,4 +398,103 @@ func initDocReaderClient(cfg *config.Config) (*client.Client, error) {
 func initOllamaService() (*ollama.OllamaService, error) {
 	// Get Ollama service from existing factory function
 	return ollama.GetOllamaService()
+}
+
+// initCacheFactory initializes the cache factory
+// Creates and configures Redis-based cache system for improved performance
+// Parameters:
+//   - cfg: Application configuration
+//
+// Returns:
+//   - Configured cache factory
+//   - Error if initialization fails
+func initCacheFactory(cfg *config.Config) (*cache.CacheFactory, error) {
+	log := logger.GetLogger(context.Background())
+	
+	// Check if cache is enabled
+	if cfg.Cache == nil || !cfg.Cache.Enabled {
+		log.Infof("[Cache] Cache is disabled, skipping initialization")
+		return nil, nil
+	}
+	
+	// Create cache configuration from app config
+	cacheConfig := &cache.CacheConfig{
+		Address:           cfg.Cache.Address,
+		Password:          cfg.Cache.Password,
+		DB:                cfg.Cache.DB,
+		PoolSize:          cfg.Cache.PoolSize,
+		MinIdleConns:      cfg.Cache.MinIdleConns,
+		MaxConnAge:        cfg.Cache.MaxConnAge,
+		DefaultTTL:        cfg.Cache.DefaultTTL,
+		KeyPrefix:         cfg.Cache.KeyPrefix,
+		ReadTimeout:       cfg.Cache.ReadTimeout,
+		WriteTimeout:      cfg.Cache.WriteTimeout,
+		EnableCompression: cfg.Cache.EnableCompression,
+		CompressionLevel:  cfg.Cache.CompressionLevel,
+	}
+	
+	// Set defaults if not provided in config
+	if cacheConfig.Address == "" {
+		cacheConfig.Address = os.Getenv("REDIS_ADDR")
+		if cacheConfig.Address == "" {
+			cacheConfig.Address = "localhost:6379"
+		}
+	}
+	
+	if cacheConfig.Password == "" {
+		cacheConfig.Password = os.Getenv("REDIS_PASSWORD")
+	}
+	
+	if cacheConfig.KeyPrefix == "" {
+		cacheConfig.KeyPrefix = "weknora:cache:"
+	}
+	
+	if cacheConfig.PoolSize == 0 {
+		cacheConfig.PoolSize = 100
+	}
+	
+	if cacheConfig.MinIdleConns == 0 {
+		cacheConfig.MinIdleConns = 10
+	}
+	
+	if cacheConfig.MaxConnAge == 0 {
+		cacheConfig.MaxConnAge = 30 * time.Minute
+	}
+	
+	if cacheConfig.DefaultTTL == 0 {
+		cacheConfig.DefaultTTL = time.Hour
+	}
+	
+	if cacheConfig.ReadTimeout == 0 {
+		cacheConfig.ReadTimeout = 5 * time.Second
+	}
+	
+	if cacheConfig.WriteTimeout == 0 {
+		cacheConfig.WriteTimeout = 5 * time.Second
+	}
+	
+	// Create cache factory
+	factory, err := cache.NewCacheFactory(cacheConfig)
+	if err != nil {
+		log.Errorf("[Cache] Failed to initialize cache factory: %v", err)
+		return nil, fmt.Errorf("failed to initialize cache factory: %w", err)
+	}
+	
+	// Perform health check
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	if err := factory.HealthCheck(ctx); err != nil {
+		log.Errorf("[Cache] Cache health check failed: %v", err)
+		return nil, fmt.Errorf("cache health check failed: %w", err)
+	}
+	
+	// Perform cache warmup
+	if err := factory.WarmupCache(ctx); err != nil {
+		log.Warnf("[Cache] Cache warmup failed: %v", err)
+		// Don't fail initialization on warmup failure
+	}
+	
+	log.Infof("[Cache] Cache factory initialized successfully with Redis at %s", cacheConfig.Address)
+	return factory, nil
 }

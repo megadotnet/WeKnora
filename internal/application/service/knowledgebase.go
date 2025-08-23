@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/cache"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
@@ -26,6 +27,7 @@ type knowledgeBaseService struct {
 	kgRepo       interfaces.KnowledgeRepository
 	chunkRepo    interfaces.ChunkRepository
 	modelService interfaces.ModelService
+	cacheFactory *cache.CacheFactory
 }
 
 // NewKnowledgeBaseService creates a new knowledge base service
@@ -33,12 +35,14 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 	kgRepo interfaces.KnowledgeRepository,
 	chunkRepo interfaces.ChunkRepository,
 	modelService interfaces.ModelService,
+	cacheFactory *cache.CacheFactory,
 ) interfaces.KnowledgeBaseService {
 	return &knowledgeBaseService{
 		repo:         repo,
 		kgRepo:       kgRepo,
 		chunkRepo:    chunkRepo,
 		modelService: modelService,
+		cacheFactory: cacheFactory,
 	}
 }
 
@@ -77,12 +81,32 @@ func (s *knowledgeBaseService) GetKnowledgeBaseByID(ctx context.Context, id stri
 
 	logger.Infof(ctx, "Retrieving knowledge base, ID: %s", id)
 
+	// Try to get from cache first if cache is available
+	if s.cacheFactory != nil {
+		knowledgeCache := s.cacheFactory.GetKnowledgeCache()
+		if cachedKB, err := knowledgeCache.GetKnowledgeBase(ctx, id); err == nil && cachedKB != nil {
+			logger.Debugf(ctx, "Knowledge base retrieved from cache, ID: %s", id)
+			return cachedKB, nil
+		} else if err != nil {
+			logger.Warnf(ctx, "Failed to get knowledge base from cache: %v", err)
+		}
+	}
+
 	kb, err := s.repo.GetKnowledgeBaseByID(ctx, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"knowledge_base_id": id,
 		})
 		return nil, err
+	}
+
+	// Cache the result if cache is available
+	if s.cacheFactory != nil {
+		knowledgeCache := s.cacheFactory.GetKnowledgeCache()
+		if err := knowledgeCache.SetKnowledgeBase(ctx, id, kb, 0); err != nil {
+			logger.Warnf(ctx, "Failed to cache knowledge base: %v", err)
+			// Don't fail the request if caching fails
+		}
 	}
 
 	logger.Infof(ctx, "Knowledge base retrieved successfully, ID: %s, name: %s", kb.ID, kb.Name)
@@ -149,6 +173,14 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 		return nil, err
 	}
 
+	// Invalidate cache if available
+	if s.cacheFactory != nil {
+		knowledgeCache := s.cacheFactory.GetKnowledgeCache()
+		if err := knowledgeCache.InvalidateKnowledgeBase(ctx, id); err != nil {
+			logger.Warnf(ctx, "Failed to invalidate knowledge base cache: %v", err)
+		}
+	}
+
 	logger.Infof(ctx, "Knowledge base updated successfully, ID: %s, name: %s", kb.ID, kb.Name)
 	return kb, nil
 }
@@ -168,6 +200,14 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 			"knowledge_base_id": id,
 		})
 		return err
+	}
+
+	// Invalidate cache if available
+	if s.cacheFactory != nil {
+		knowledgeCache := s.cacheFactory.GetKnowledgeCache()
+		if err := knowledgeCache.InvalidateKnowledgeBase(ctx, id); err != nil {
+			logger.Warnf(ctx, "Failed to invalidate knowledge base cache: %v", err)
+		}
 	}
 
 	logger.Infof(ctx, "Knowledge base deleted successfully, ID: %s", id)
@@ -265,6 +305,18 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 ) ([]*types.SearchResult, error) {
 	logger.Infof(ctx, "Hybrid search parameters, knowledge base ID: %s, query text: %s", id, params.QueryText)
 
+	// Check cache first if available
+	if s.cacheFactory != nil {
+		knowledgeCache := s.cacheFactory.GetKnowledgeCache()
+		queryHash := knowledgeCache.(*cache.KnowledgeCacheImpl).GenerateSearchQueryHash(params.QueryText, id, params)
+		if cachedResults, err := knowledgeCache.GetSearchResults(ctx, queryHash); err == nil && cachedResults != nil {
+			logger.Infof(ctx, "Search results retrieved from cache, count: %d", len(cachedResults))
+			return cachedResults, nil
+		} else if err != nil {
+			logger.Warnf(ctx, "Failed to get search results from cache: %v", err)
+		}
+	}
+
 	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 	logger.Infof(ctx, "Creating composite retrieval engine, tenant ID: %d", tenantInfo.ID)
 
@@ -283,7 +335,7 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 	if retrieveEngine.SupportRetriever(types.VectorRetrieverType) {
 		logger.Info(ctx, "Vector retrieval supported, preparing vector retrieval parameters")
 
-		kb, err = s.repo.GetKnowledgeBaseByID(ctx, id)
+		kb, err = s.GetKnowledgeBaseByID(ctx, id) // This will use cache if available
 		if err != nil {
 			logger.ErrorWithFields(ctx, err, map[string]interface{}{
 				"knowledge_base_id": id,
@@ -299,14 +351,36 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 		}
 		logger.Infof(ctx, "Embedding model retrieved: %v", embeddingModel)
 
-		// Generate embedding vector for the query text
-		logger.Info(ctx, "Starting to generate query embedding")
-		queryEmbedding, err := embeddingModel.Embed(ctx, params.QueryText)
-		if err != nil {
-			logger.Errorf(ctx, "Failed to embed query text, query text: %s, error: %v", params.QueryText, err)
-			return nil, err
+		// Try to get cached query embedding first
+		var queryEmbedding []float32
+		if s.cacheFactory != nil {
+			vectorCache := s.cacheFactory.GetVectorCache()
+			if cachedEmbedding, err := vectorCache.(*cache.VectorCacheImpl).GetQueryEmbedding(ctx, params.QueryText); err == nil && cachedEmbedding != nil {
+				logger.Debugf(ctx, "Query embedding retrieved from cache, dimension: %d", len(cachedEmbedding))
+				queryEmbedding = cachedEmbedding
+			} else if err != nil {
+				logger.Warnf(ctx, "Failed to get query embedding from cache: %v", err)
+			}
 		}
-		logger.Infof(ctx, "Query embedding generated successfully, embedding vector length: %d", len(queryEmbedding))
+
+		// Generate embedding if not cached
+		if queryEmbedding == nil {
+			logger.Info(ctx, "Starting to generate query embedding")
+			queryEmbedding, err = embeddingModel.Embed(ctx, params.QueryText)
+			if err != nil {
+				logger.Errorf(ctx, "Failed to embed query text, query text: %s, error: %v", params.QueryText, err)
+				return nil, err
+			}
+			logger.Infof(ctx, "Query embedding generated successfully, embedding vector length: %d", len(queryEmbedding))
+
+			// Cache the query embedding if cache is available
+			if s.cacheFactory != nil {
+				vectorCache := s.cacheFactory.GetVectorCache()
+				if err := vectorCache.(*cache.VectorCacheImpl).SetQueryEmbedding(ctx, params.QueryText, queryEmbedding, 0); err != nil {
+					logger.Warnf(ctx, "Failed to cache query embedding: %v", err)
+				}
+			}
+		}
 
 		retrieveParams = append(retrieveParams, types.RetrieveParams{
 			Query:            params.QueryText,
@@ -371,7 +445,22 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 	deduplicatedChunks := common.Deduplicate(func(r *types.IndexWithScore) string { return r.ChunkID }, matchResults...)
 	logger.Infof(ctx, "Result count after deduplication: %d", len(deduplicatedChunks))
 
-	return s.processSearchResults(ctx, deduplicatedChunks)
+	searchResults, err := s.processSearchResults(ctx, deduplicatedChunks)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the search results if cache is available
+	if s.cacheFactory != nil && searchResults != nil {
+		knowledgeCache := s.cacheFactory.GetKnowledgeCache()
+		queryHash := knowledgeCache.(*cache.KnowledgeCacheImpl).GenerateSearchQueryHash(params.QueryText, id, params)
+		if err := knowledgeCache.SetSearchResults(ctx, queryHash, searchResults, 0); err != nil {
+			logger.Warnf(ctx, "Failed to cache search results: %v", err)
+			// Don't fail the request if caching fails
+		}
+	}
+
+	return searchResults, nil
 }
 
 // processSearchResults handles the processing of search results, optimizing database queries

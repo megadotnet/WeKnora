@@ -3,6 +3,32 @@ server:
   port: 8080
   host: "0.0.0.0"
 
+# 缓存配置
+cache:
+  enabled: true
+  address: "${REDIS_ADDR:-localhost:6379}"
+  password: "${REDIS_PASSWORD:-}"
+  db: 0
+  pool_size: 100
+  min_idle_conns: 10
+  max_conn_age: 30m
+  default_ttl: 1h
+  key_prefix: "weknora:cache:"
+  read_timeout: 5s
+  write_timeout: 5s
+  enable_compression: true
+  compression_level: 6
+  knowledge:
+    search_results_ttl: 30m
+    knowledge_base_ttl: 2h
+    knowledge_info_ttl: 1h
+    chunk_info_ttl: 1h
+  vector:
+    vector_results_ttl: 15m
+    embeddings_ttl: 24h
+    similarity_results_ttl: 30m
+    query_embeddings_ttl: 1h
+
 # 对话服务配置
 conversation:
   max_rounds: 5

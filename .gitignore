@@ -7,6 +7,9 @@
 *_secret
 *.key
 *.crt
+.codebuddy
+.idea
+.qoder
 
 # IDE和编辑器文件
 .idea/

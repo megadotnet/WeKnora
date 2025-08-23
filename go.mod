@@ -12,6 +12,7 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.2.1
 	github.com/google/uuid v1.6.0
 	github.com/hibiken/asynq v0.25.1
+	github.com/lib/pq v1.10.9
 	github.com/minio/minio-go/v7 v7.0.90
 	github.com/ollama/ollama v0.11.4
 	github.com/panjf2000/ants/v2 v2.11.2
